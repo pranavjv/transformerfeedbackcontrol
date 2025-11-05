@@ -1,80 +1,101 @@
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
+
+import argparse
+import os
+import math
 import numpy as np
-import pickle
-from sklearn.model_selection import train_test_split
-from torch import optim
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from typing import Tuple
+from models import QuantumTransformer
+from data_loader import make_dataloader, PAD_ID, SOS_ID
+from utils import ce_loss_ignore_pad
 
-class QuantumEncoder(nn.Module):
-    def __init__(self, input_dim, embed_dim, nhead, num_layers):
-        super(QuantumEncoder, self).__init__()
-        self.embed = nn.Linear(input_dim, embed_dim)
-        self.transformer_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(embed_dim, nhead), num_layers)
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=str, required=True, help="Path to tls_dataset.npz")
+    ap.add_argument("--d_model", type=int, default=256)
+    ap.add_argument("--nhead", type=int, default=8)
+    ap.add_argument("--enc_layers", type=int, default=4)
+    ap.add_argument("--dec_layers", type=int, default=4)
+    ap.add_argument("--ff_dim", type=int, default=512)
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--lr", type=float, default=5e-4)
+    ap.add_argument("--weight_decay", type=float, default=0.01)
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--save", type=str, default="checkpoints/tls_transformer.pt")
+    return ap.parse_args()
 
-    def forward(self, x):
-        x = self.embed(x)
-        x = self.transformer_encoder(x.unsqueeze(0)).squeeze(0)
-        return x
+def main():
+    args = parse_args()
+    os.makedirs(os.path.dirname(args.save), exist_ok=True)
 
-class QuantumDecoder(nn.Module):
-    def __init__(self, output_dim, embed_dim, nhead, num_layers):
-        super(QuantumDecoder, self).__init__()
-        self.embed = nn.Linear(output_dim, embed_dim)
-        self.transformer_decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(embed_dim, nhead), num_layers)
-        self.predict = nn.Linear(embed_dim, output_dim)
+    # Data
+    train_loader, bin_centers = make_dataloader(args.data, batch_size=args.batch_size, shuffle=True)
+    num_bins = len(bin_centers)
 
-    def forward(self, x, context):
-        x = self.embed(x)
-        x = self.transformer_decoder(x.unsqueeze(0), context.unsqueeze(0)).squeeze(0)
-        x = self.predict(x)
-        return x
+    # Peek enc_in_dim from first batch
+    first_batch = next(iter(train_loader))
+    enc_in_dim = first_batch['enc_in_dim']
 
-class QuantumTransformer(nn.Module):
-    def __init__(self, input_dim, output_dim, embed_dim, nhead, num_layers):
-        super(QuantumTransformer, self).__init__()
-        self.encoder = QuantumEncoder(input_dim, embed_dim, nhead, num_layers)
-        self.decoder = QuantumDecoder(output_dim, embed_dim, nhead, num_layers)
-        
-    def forward(self, x, y):
-        context = self.encoder(x)
-        out = self.decoder(y, context)
-        return out
+    # Model
+    model = QuantumTransformer(enc_in_dim=enc_in_dim,
+                               d_model=args.d_model,
+                               nhead=args.nhead,
+                               num_encoder_layers=args.enc_layers,
+                               num_decoder_layers=args.dec_layers,
+                               dim_feedforward=args.ff_dim,
+                               dropout=args.dropout,
+                               num_bins=num_bins,
+                               pad_id=PAD_ID,
+                               sos_id=SOS_ID).to(args.device)
 
-def train_model(model, dataloader, epochs, lr):
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    for epoch in range(epochs):
-        for i, batch in enumerate(dataloader):
-            rho, measurement_record, optimal_delta = [b.to(device) for b in batch]
+    best_loss = float("inf")
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_tokens = 0
+
+        for batch in train_loader:
+            src = batch['src'].to(args.device)  # (B,S,E)
+            src_pad = batch['src_key_padding_mask'].to(args.device)  # (B,S)
+            tgt_in = batch['tgt_in'].to(args.device)  # (B,T)
+            tgt_out = batch['tgt_out'].to(args.device)  # (B,T)
+            tgt_pad = batch['tgt_key_padding_mask'].to(args.device)  # (B,T)
+
             optimizer.zero_grad()
+            logits = model(src, src_pad, tgt_in, tgt_pad)  # (B,T,C)
 
-            # Shift the optimal_delta to create input and target sequences
-            zeros = torch.zeros(optimal_delta.shape[0], 1).to(device)  # Create a tensor of zeros
-            decoder_input = torch.cat((zeros, optimal_delta[:, :-1]), dim=1)  # Append the tensor of zeros at the beginning
-            decoder_target = optimal_delta  # No need to shift decoder_target
-            
-            outputs = model(rho, decoder_input)  # Feed the shifted optimal_delta into the model
-            loss = criterion(outputs, decoder_target)  # Compute loss between outputs and the shifted targets
+            # Targets are in [0..num_bins-1]; logits correspond to classes 0..num_bins-1
+            loss = ce_loss_ignore_pad(logits, tgt_out, ignore_index=-100)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-        print(f'Epoch {epoch + 1}/{epochs} Loss: {loss.item()}')
-        wandb.log({"Train Loss": loss})
+            with torch.no_grad():
+                not_pad = (tgt_out != -100).sum().item()
+            total_loss += loss.item() * not_pad
+            total_tokens += not_pad
 
+        scheduler.step()
+        avg_loss = total_loss / max(1, total_tokens)
+        print(f"Epoch {epoch:02d} | Train CE/token: {avg_loss:.6f} | lr={scheduler.get_last_lr()[0]:.2e}")
 
-    return model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save({'model_state': model.state_dict(),
+                        'bin_centers': bin_centers,
+                        'enc_in_dim': enc_in_dim}, args.save)
+            print(f"  Saved checkpoint to {args.save} (best loss {best_loss:.6f})")
 
-model= QuantumTransformer(102, 4, 128, 4, 2)
+    print("Training complete.")
 
-wandb.init(project="markovian_transformer")
-wandb.watch(model)
-model = train_model(model, train_dataloader, epochs=10, lr=0.001)
-#save the model
-torch.save(model, "mymodel.pt")
-scripted_model = torch.jit.script(model)
-torch.jit.save(scripted_model, 'mymodelscript.pt')
-print(model)
+if __name__ == "__main__":
+    main()

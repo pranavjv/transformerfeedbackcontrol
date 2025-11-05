@@ -1,94 +1,135 @@
+from typing import Optional, Tuple, Dict, List
 import numpy as np
-from qutip import *
-import pickle
-from tqdm import tqdm
+from numpy.random import default_rng
+from qutip import Qobj, sigmax, sigmaz, sigmam, smesolve, Options
+from utils import TLSParams, fidelity, make_lambda_bins
 
-# Define parameter ranges
-Delta_range = np.linspace(0, 1, 50)
+def _extract_last_state_states(states):
+    if isinstance(states[0], list):
+        return states[0][-1]
+    # sometimes it's a list of Qobj across time directly (ntraj=1 path)
+    return states[-1]
 
+def _extract_meas_increment(measurements):
+    if measurements is None:
+        return None
+    m = measurements[0] if isinstance(measurements, list) else measurements
+    m = np.asarray(m)
+    if m.ndim == 2:
+        return float(m[-1, 0])
+    elif m.ndim == 1:
+        return float(m[-1])
+    else:
+        # unexpected shape
+        return float(np.ravel(m)[-1])
 
-# Define initial state parameter range
-rho0 = qutip.basis(2, 0) * qutip.basis(2, 0).dag()
-rho1 = qutip.basis(2, 1) * qutip.basis(2, 1).dag()
-initial_rho_range = [(1 - p) * rho0 + p * rho1 for p in np.linspace(0, 1, 20)]
+def tls_step_smesolve(rho: Qobj,
+                      lam: float,
+                      params: TLSParams,
+                      rng_step_seed: int) -> Tuple[Qobj, float]:
+    import numpy as _np
+    _np.random.seed(rng_step_seed)
 
-# Define the target state
-target_state = (basis(2, 0) + 1j * basis(2, 1)).unit() * (basis(2, 0) + 1j * basis(2, 1)).unit().dag()
+    H = 0.5 * params.epsilon * sigmaz() + 0.5 * lam * sigmax()
+    c = np.sqrt(params.kappa) * sigmam()
+    # inefficiency enters through scaling of the stochastic term; use sc_ops = [sqrt(eta) * c]
+    sc = np.sqrt(params.eta) * c
 
-# Define time steps
-t_max = 10
-num_steps = 100
-time_steps = np.linspace(0, t_max, num_steps)
+    tlist = [0.0, float(params.dt)]
+    opts = Options(store_states=True, nsteps=10000, atol=1e-10, rtol=1e-8)
+    res = smesolve(H, rho, tlist,
+                   c_ops=[c],
+                   sc_ops=[sc],
+                   e_ops=None,
+                   ntraj=1,
+                   options=opts,
+                   store_measurement=True)
 
-# Constants
-eps = 0.05
-lam = 0.10
-Omega = 1.0
-N_RC = 6
-kappa = 1.0
-eta = 1.0
-ntraj = 10
+    rho_next = _extract_last_state_states(res.states)
+    dr = _extract_meas_increment(res.measurements)
+    if dr is None:
+        # Fallback: compute expected mean term only (no noise term available) — rare with recent QuTiP
+        # dr ≈ Tr[(c+c†)ρ] dt
+        dr = float(((c + c.dag()) * rho).tr().real * params.dt)
+    return rho_next, dr
 
-# Objective function to maximize fidelity with the target state
-def objective_function(rho):
-    return fidelity(rho, target_state)
+def generate_tls_trajectory_smesolve(T: int,
+                                     bin_centers: np.ndarray,
+                                     params: TLSParams,
+                                     psi_target: np.ndarray,
+                                     seed: Optional[int] = None) -> Dict[str, np.ndarray]:
+    rng = default_rng(seed)
+    # random pure initial state on Bloch sphere (matches paper's variety of initial states)
+    theta = np.arccos(1 - 2 * rng.uniform(0, 1))
+    phi = rng.uniform(0, 2*np.pi)
+    # |psi> = cos(theta/2)|0> + e^{i phi} sin(theta/2)|1>
+    v0 = np.cos(theta/2.0)
+    v1 = np.sin(theta/2.0) * np.exp(1j * phi)
+    psi = Qobj(np.array([[v0],[v1]], dtype=np.complex128))
+    rho = psi * psi.dag()
+    rho0 = rho.full()
 
-# Define the master equation
-sz = tensor(sigmaz(), qeye(N_RC))
-sx = tensor(sigmax(), qeye(N_RC))
-a = tensor(qeye(2), destroy(N_RC))
+    r_seq: List[float] = []
+    lam_idx_seq: List[int] = []
 
-# Setup operator lists
-c_ops = [np.sqrt(kappa) * a]
-sc_ops = [np.sqrt(kappa * eta) * a]
+    # Stepwise locally-greedy: for each t, try all λ bins with the SAME Wiener increment
+    for t in range(T):
+        step_seed = int(rng.integers(0, 2**31-1))
+        best_idx = 0
+        best_F = -1e9
+        best_rho = None
+        best_dr = 0.0
+        for i, lam in enumerate(bin_centers):
+            rho_next, dr = tls_step_smesolve(rho, float(lam), params, step_seed)
+            # fidelity with pure target |psi_targ>
+            F = float(np.real(np.conj(psi_target.T) @ rho_next.full() @ psi_target)[0,0])
+            if F > best_F:
+                best_F = F
+                best_idx = i
+                best_rho = rho_next
+                best_dr = dr
+        lam_idx_seq.append(best_idx)
+        r_seq.append(best_dr)
+        rho = best_rho
 
-# Dataset list
-dataset = []
+    return {
+        'rho0_real': rho0.real.astype(np.float64),
+        'rho0_imag': rho0.imag.astype(np.float64),
+        'r_seq': np.array(r_seq, dtype=np.float64),
+        'lambda_idx': np.array(lam_idx_seq, dtype=np.int64),
+    }
 
-# Save a dataset part number
-dataset_part = 1
+def generate_tls_dataset(num_traj: int,
+                         T: int,
+                         lmin: float,
+                         lmax: float,
+                         num_bins: int,
+                         params: TLSParams,
+                         psi_target: np.ndarray,
+                         seed: Optional[int] = None) -> str:
+    rng = default_rng(seed)
+    bin_centers = make_lambda_bins(lmin, lmax, num_bins)
+    items = [generate_tls_trajectory_smesolve(T, bin_centers, params, psi_target,
+                                              seed=int(rng.integers(0, 2**31-1)))
+             for _ in range(num_traj)]
+    rho0_real = np.stack([it['rho0_real'] for it in items], axis=0)
+    rho0_imag = np.stack([it['rho0_imag'] for it in items], axis=0)
+    r_seq = np.array([it['r_seq'] for it in items], dtype=object)
+    lambda_idx = np.array([it['lambda_idx'] for it in items], dtype=object)
 
-# Trajectory loop
-for initial_rho in tqdm(initial_rho_range, desc="Processing initial states"):
-    initial_state = tensor(initial_rho, qutip.thermal_dm(N_RC, 1))
-    measurement_record = []
+    out_path = "tls_dataset.npz"
+    np.savez(out_path,
+             rho0_real=rho0_real,
+             rho0_imag=rho0_imag,
+             r_seq=r_seq,
+             lambda_idx=lambda_idx,
+             lambda_bins=bin_centers)
+    return out_path
 
-    for t_idx in range(num_steps - 1):
-        # Loop over possible Deltas to find the optimal one
-        best_fidelity_avg = -np.inf
-        best_delta = None
-        measurements_for_optimal_delta = None
-
-        for delta in Delta_range:
-            fidelities = []
-            measurements_for_delta = []
-            for _ in range(ntraj):
-                H_t = (eps / 2) * sz + (delta / 2) * sx + lam * sx * (a + a.dag()) + Omega * a.dag() * a
-                result = smesolve(H_t, initial_state, np.array([time_steps[t_idx], time_steps[t_idx + 1]]), c_ops, sc_ops, method='homodyne', ntraj=1, store_measurement=True)
-                rho_t = result.states[0][0].ptrace(0)
-                rho_t_next = result.states[0][1].ptrace(0)
-                initial_state = result.states[0][1]
-                fidelities.append(objective_function(rho_t_next))
-                measurements_for_delta.append(result.measurement[0][1])
-
-            # Average fidelity over all trajectories
-            fidelity_avg = np.mean(fidelities)
-            if fidelity_avg > best_fidelity_avg:
-                best_fidelity_avg = fidelity_avg
-                best_delta = delta
-                measurements_for_optimal_delta = measurements_for_delta
-
-        # Append to the measurement record and dataset
-        #rho_vec = np.concatenate([np.real(rho_t.full().flatten()), np.imag(rho_t.full().flatten())])
-        measurement_record.append(np.mean(measurements_for_optimal_delta))  # Storing average measurement for the optimal Delta
-        if t_idx > 0:  # Avoids adding to the dataset when there's no history
-            dataset.append((rho_t.full().flatten(), measurement_record[:-1].copy(), best_delta))  # Exclude the current measurement from the history
-
-    # Save the dataset after each initial state
-    with open(f'dataset_coupling_{dataset_part}.pkl', 'wb') as f:
-        pickle.dump(dataset, f)
-    dataset_part += 1
-
-# Save the complete dataset
-with open('dataset_coupling_total.pkl', 'wb') as f:
-    pickle.dump(dataset, f)
+if __name__ == "__main__":
+    # default example similar to paper's TLS
+    params = TLSParams(epsilon=0.0, kappa=1.0, eta=0.7, dt=0.03)
+    psi_targ = (1/np.sqrt(2)) * np.array([[1.0], [1.0j]], dtype=np.complex128)
+    path = generate_tls_dataset(num_traj=64, T=80, lmin=-4.0, lmax=4.0, num_bins=51,
+                                params=params, psi_target=psi_targ, seed=123)
+    print("Wrote", path)
