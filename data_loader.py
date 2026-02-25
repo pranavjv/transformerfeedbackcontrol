@@ -97,6 +97,8 @@ def tls_collate(batch: List[Dict[str, Any]], add_rho0_token: bool = True) -> Dic
     T_max = max(len(b['lambda_idx']) for b in batch)
     tgt_out = np.full((B, T_max), fill_value=PAD_ID, dtype=np.int64)
     tgt_in = np.full((B, T_max), fill_value=PAD_ID, dtype=np.int64)
+    # Optional decoder-aligned measurement features (previous measurement increment).
+    tgt_meas = np.zeros((B, T_max, 1), dtype=np.float32)
     tgt_pad_mask = np.ones((B, T_max), dtype=bool)
 
     for i, b in enumerate(batch):
@@ -109,6 +111,16 @@ def tls_collate(batch: List[Dict[str, Any]], add_rho0_token: bool = True) -> Dic
         if T > 1:
             shifted[1:] = lidx[:-1] + 1
         tgt_in[i, :T] = shifted
+
+        # Align measurement features so that step t only sees r_{t-1} (discrete feedback delay = 1).
+        r = np.asarray(b['r_seq'], dtype=np.float32).reshape(-1)
+        if r.shape[0] != T:
+            # Safety: if r has a different length, align up to the min length.
+            L = min(r.shape[0], T)
+        else:
+            L = T
+        if L > 1:
+            tgt_meas[i, 1:L, 0] = r[:L-1]
         tgt_pad_mask[i, :T] = False
 
     batch_out = {
@@ -116,6 +128,7 @@ def tls_collate(batch: List[Dict[str, Any]], add_rho0_token: bool = True) -> Dic
         'src_key_padding_mask': torch.from_numpy(src_key_padding_mask),
         'tgt_in': torch.from_numpy(tgt_in).long(),
         'tgt_out': torch.from_numpy(tgt_out).long(),
+        'tgt_meas': torch.from_numpy(tgt_meas).float(),
         'tgt_key_padding_mask': torch.from_numpy(tgt_pad_mask),
         'enc_in_dim': enc_in_dim
     }

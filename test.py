@@ -13,7 +13,7 @@ def run():
     sys.argv = ["transformer_train.py", "--data", path, "--epochs", "2", "--batch_size", "8", "--save", "checkpoints/test.pt"]
     train_main()
     # Predict
-    sys.argv = ["predict.py", "--data", path, "--checkpoint", "checkpoints/test.pt", "--max_len", "40"]
+    sys.argv = ["predict.py", "--data", path, "--checkpoint", "checkpoints/test.pt", "--T", "40"]
     predict_main()
 
 if __name__ == "__main__":

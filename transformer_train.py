@@ -12,6 +12,15 @@ from models import QuantumTransformer
 from data_loader import make_dataloader, PAD_ID, SOS_ID
 from utils import ce_loss_ignore_pad
 
+
+# Avoid pathological OpenMP thread pools in some containerized CPU environments
+# when using nn.Transformer.
+_torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "1"))
+try:
+    torch.set_num_threads(_torch_threads)
+except Exception:
+    pass
+
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, required=True, help="Path to tls_dataset.npz")
@@ -26,6 +35,10 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=5e-4)
     ap.add_argument("--weight_decay", type=float, default=0.01)
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--decoder_input", type=str, default="measurements",
+                    choices=["measurements", "actions", "hybrid"],
+                    help="What to feed the decoder. 'measurements' matches the paper-style causal measurement decoder; 'actions' uses teacher-forced action tokens; 'hybrid' uses both.")
+    ap.add_argument("--load", type=str, default=None, help="Optional checkpoint to initialize from (transfer learning / fine-tuning)")
     ap.add_argument("--save", type=str, default="checkpoints/tls_transformer.pt")
     return ap.parse_args()
 
@@ -53,6 +66,16 @@ def main():
                                pad_id=PAD_ID,
                                sos_id=SOS_ID).to(args.device)
 
+    if args.load is not None:
+        ckpt = torch.load(args.load, map_location=args.device)
+        # Sanity checks
+        if 'enc_in_dim' in ckpt and int(ckpt['enc_in_dim']) != int(enc_in_dim):
+            raise ValueError(f"Checkpoint enc_in_dim={ckpt['enc_in_dim']} does not match dataset enc_in_dim={enc_in_dim}")
+        if 'bin_centers' in ckpt and len(ckpt['bin_centers']) != int(num_bins):
+            raise ValueError(f"Checkpoint num_bins={len(ckpt['bin_centers'])} does not match dataset num_bins={num_bins}")
+        model.load_state_dict(ckpt['model_state'], strict=True)
+        print(f"Loaded checkpoint: {args.load}")
+
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
@@ -68,10 +91,24 @@ def main():
             src_pad = batch['src_key_padding_mask'].to(args.device)  # (B,S)
             tgt_in = batch['tgt_in'].to(args.device)  # (B,T)
             tgt_out = batch['tgt_out'].to(args.device)  # (B,T)
+            tgt_meas = batch.get('tgt_meas', None)
+            if tgt_meas is not None:
+                tgt_meas = tgt_meas.to(args.device)
             tgt_pad = batch['tgt_key_padding_mask'].to(args.device)  # (B,T)
 
+            # Configure decoder inputs.
+            if args.decoder_input == "measurements":
+                tgt_in_eff = torch.zeros_like(tgt_in)
+                tgt_meas_eff = tgt_meas
+            elif args.decoder_input == "actions":
+                tgt_in_eff = tgt_in
+                tgt_meas_eff = None
+            else:  # hybrid
+                tgt_in_eff = tgt_in
+                tgt_meas_eff = tgt_meas
+
             optimizer.zero_grad()
-            logits = model(src, src_pad, tgt_in, tgt_pad)  # (B,T,C)
+            logits = model(src, src_pad, tgt_in_eff, tgt_pad, tgt_meas=tgt_meas_eff)  # (B,T,C)
 
             # Targets are in [0..num_bins-1]; logits correspond to classes 0..num_bins-1
             loss = ce_loss_ignore_pad(logits, tgt_out, ignore_index=-100)

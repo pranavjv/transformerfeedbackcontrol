@@ -20,13 +20,15 @@ class MixedFieldIsingEnv:
                  h: float = 1.0,
                  kappa: float = 0.1,
                  eta: float = 1.0,
-                 dt: float = 0.05):
+                 dt: float = 0.05,
+                 horizon: int = 100):
         self.N = N
         self.g = g
         self.h = h
         self.kappa = kappa
         self.eta = eta
         self.dt = dt
+        self.horizon = int(horizon)
 
         # Prebuild operators
         self.I = qeye(2)
@@ -55,6 +57,14 @@ class MixedFieldIsingEnv:
         psi0 = tensor([Qobj([[1.0],[0.0]]) for _ in range(self.N)])
         return (psi0 * psi0.dag())  # density matrix
 
+    def ground_state_rho(self, lam: float) -> Qobj:
+        """Exact ground-state density matrix of H(lam) (closed-system)."""
+        H = self.H(lam)
+        # eigenstates returns (evals, evecs)
+        evals, evecs = H.eigenstates(sparse=False)
+        psi0 = evecs[int(np.argmin(evals))]
+        return psi0 * psi0.dag()
+
     def reset(self, rho0: Optional[Qobj] = None) -> Dict[str, float]:
         self.rho = self.random_product_state() if rho0 is None else rho0
         self.t = 0
@@ -66,20 +76,25 @@ class MixedFieldIsingEnv:
         Returns (obs, reward, done, info) where obs contains the measurement increment dr.
         Reward is 0 for all intermediate steps; you should compute terminal reward externally (final energy).
         """
+        rho_old = self.rho
         dW = self.rng.normal(0.0, np.sqrt(self.dt))
         H = self.H(lam)
+
+        # Measurement record increment uses the *pre-step* state ρ(t).
+        dr = ((self.c_jump + self.c_jump.dag()) * rho_old).tr().real * self.dt + dW / np.sqrt(self.eta)
+
         # d rho
-        drho = (-1j * (H * self.rho - self.rho * H)) * self.dt \
-               + D(self.c_jump, self.rho) * self.dt \
-               + np.sqrt(self.eta) * H_super(self.c_jump, self.rho) * dW
-        self.rho = (self.rho + drho)
+        drho = (-1j * (H * rho_old - rho_old * H)) * self.dt \
+               + D(self.c_jump, rho_old) * self.dt \
+               + np.sqrt(self.eta) * H_super(self.c_jump, rho_old) * dW
+        self.rho = (rho_old + drho)
         self.rho = 0.5 * (self.rho + self.rho.dag())
         self.rho = self.rho / self.rho.tr()
 
-        dr = ((self.c_jump + self.c_jump.dag()) * self.rho).tr().real * self.dt + dW / np.sqrt(self.eta)
         self.t += 1
         obs = {'dr': float(dr)}
-        return obs, 0.0, False, {}
+        done = (self.t >= self.horizon)
+        return obs, 0.0, done, {}
 
     def energy(self, lam: float) -> float:
         H = self.H(lam)

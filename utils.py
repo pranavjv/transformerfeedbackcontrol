@@ -89,11 +89,11 @@ def pure_state_from_bloch(theta: float, phi: float) -> np.ndarray:
     rho = psi @ psi.conj().T
     return rho
 
-def fidelity(rho: np.ndarray, psi_target: np.ndarray) -> float:
-    """
-    Fidelity for pure |psi_targ>: F = <psi| rho |psi>
-    """
-    return float(np.real(psi_target.conj().T @ rho @ psi_target).item())
+# def fidelity(rho: np.ndarray, psi_target: np.ndarray) -> float:
+#     """
+#     Fidelity for pure |psi_targ>: F = <psi| rho |psi>
+#     """
+#     return float(np.real(psi_target.conj().T @ rho @ psi_target).item())
 
 def make_lambda_bins(lmin: float, lmax: float, num_bins: int) -> np.ndarray:
     """

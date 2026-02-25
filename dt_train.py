@@ -4,9 +4,17 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from ising_env import MixedFieldIsingEnv
 from dt_transformer import DecisionTransformer
+
+
+# Avoid pathological OpenMP thread pools in some containerized CPU environments.
+_torch_threads = int(os.environ.get("TORCH_NUM_THREADS", "1"))
+try:
+    torch.set_num_threads(_torch_threads)
+except Exception:
+    pass
 
 PAD_ID = -100
 SOS_ID = 0
@@ -66,38 +74,59 @@ def collect_episode(env: MixedFieldIsingEnv,
                     H_final_lambda: float,
                     horizon: int,
                     device: str,
-                    eps_greedy: float = 0.1) -> Dict[str, Any]:
+                    eps_greedy: float = 0.1,
+                    *,
+                    lambda0: Optional[float] = None,
+                    lambdaT: Optional[float] = None,
+                    fix_endpoints: bool = False,
+                    desired_rtg: float = 0.0,
+                    start_in_ground_state: bool = True) -> Dict[str, Any]:
     """
     Run one episode using eps-greedy from model; if model is None, act uniformly at random.
     Returns dict with 'states' (list of [dr, t/T]), 'actions_idx', 'rtgs', 'reward'.
     """
-    env.reset()
+    # Initialize.
+    if start_in_ground_state and (lambda0 is not None):
+        env.reset(rho0=env.ground_state_rho(float(lambda0)))
+    else:
+        env.reset()
     states = []
     actions_idx = []
-    dr_hist = []
-    # We supply a simple 2-dim state: [dr_t, t/T]
+    dr_prev = 0.0
+
+    # State at decision time t is what is known *before* applying λ_t.
+    # We use the latest measurement increment (dr_{t-1}) and normalized time.
     for t in range(horizon):
-        obs, _, _, _ = env.step(lam=0.0)  # we need dr_t before selecting next λ_{t+1}; but to simplify, treat action at same step
-        dr = obs['dr']
-        dr_hist.append(dr)
-        s = np.array([dr, t / max(1, horizon-1)], dtype=np.float32)
+        s = np.array([dr_prev, t / max(1, horizon - 1)], dtype=np.float32)
         states.append(s)
 
-        if model is None or np.random.rand() < eps_greedy:
-            a_idx = np.random.randint(0, len(bin_centers))
+        # Enforce endpoints if requested.
+        if fix_endpoints and lambda0 is not None and t == 0:
+            a_idx = int(np.argmin(np.abs(bin_centers - float(lambda0))))
+        elif fix_endpoints and lambdaT is not None and t == (horizon - 1):
+            a_idx = int(np.argmin(np.abs(bin_centers - float(lambdaT))))
         else:
-            with torch.no_grad():
-                st = torch.from_numpy(np.array(states, dtype=np.float32)).unsqueeze(0).to(device)  # (1,t+1,2)
-                rtg = torch.zeros((1, t+1, 1), dtype=torch.float32, device=device)
-                acts_in = torch.zeros((1, t+1), dtype=torch.long, device=device)  # all SOS
-                logits = model(rtg, st, acts_in)
-                a_idx = int(torch.argmax(logits[0, -1, :]).item())
+            if model is None or np.random.rand() < eps_greedy:
+                a_idx = int(np.random.randint(0, len(bin_centers)))
+            else:
+                with torch.no_grad():
+                    st = torch.from_numpy(np.array(states, dtype=np.float32)).unsqueeze(0).to(device)  # (1,t+1,2)
+                    rtg = torch.full((1, st.size(1), 1), float(desired_rtg), dtype=torch.float32, device=device)
+                    act_tokens = torch.zeros((1, st.size(1)), dtype=torch.long, device=device)
+                    if len(actions_idx) > 0:
+                        act_tokens[0, 1:] = torch.tensor(actions_idx, dtype=torch.long, device=device) + 1
+                    logits = model(rtg, st, act_tokens)
+                    a_idx = int(torch.argmax(logits[0, -1, :]).item())
+
         actions_idx.append(a_idx)
-        # advance dynamics under chosen action for next step
-        env.step(lam=float(bin_centers[a_idx]))
+
+        # Advance SME by one step under chosen action and observe dr_t
+        obs, _, _, _ = env.step(lam=float(bin_centers[a_idx]))
+        dr_prev = obs['dr']
 
     # terminal reward: negative of final energy (we want to minimize energy)
-    reward = -float(env.energy(H_final_lambda))
+    # terminal reward: negative of final energy (minimize energy)
+    reward = -float(env.energy(float(H_final_lambda)))
     # return-to-go: we use constant RTG = reward at all steps (sparse terminal)
     rtgs = [reward for _ in range(horizon)]
 
@@ -120,6 +149,11 @@ def parse_args():
     ap.add_argument("--lmin", type=float, default=-2.0)
     ap.add_argument("--lmax", type=float, default=2.0)
     ap.add_argument("--num_bins", type=int, default=21)
+    ap.add_argument("--lambda0", type=float, default=None, help="Fixed start value λ0 (optional)")
+    ap.add_argument("--lambdaT", type=float, default=None, help="Fixed end value λT (optional)")
+    ap.add_argument("--fix_endpoints", action="store_true", help="Force λ0 at t=0 and λT at final step")
+    ap.add_argument("--desired_rtg", type=float, default=0.0, help="Return-to-go conditioning during rollout")
+    ap.add_argument("--start_in_ground_state", action="store_true", help="Start each episode in ground state of H(λ0)")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--iters", type=int, default=5, help="IR-DT outer iterations (collect+train)")
@@ -135,7 +169,7 @@ def main():
     bin_centers = np.linspace(args.lmin, args.lmax, args.num_bins, dtype=np.float32)
 
     # environment
-    env = MixedFieldIsingEnv(N=args.N, g=args.g, h=args.h, kappa=args.kappa, eta=args.eta, dt=args.dt)
+    env = MixedFieldIsingEnv(N=args.N, g=args.g, h=args.h, kappa=args.kappa, eta=args.eta, dt=args.dt, horizon=args.horizon)
 
     # model
     model = DecisionTransformer(state_dim=2, num_bins=args.num_bins).to(args.device)
@@ -149,10 +183,15 @@ def main():
         episodes = []
         for _ in range(args.batch_size):
             traj = collect_episode(env, model if replay else None, bin_centers,
-                                   H_final_lambda=bin_centers[-1],
+                                   H_final_lambda=float(args.lambdaT) if args.lambdaT is not None else float(bin_centers[-1]),
                                    horizon=args.horizon,
                                    device=args.device,
-                                   eps_greedy=0.2)
+                                   eps_greedy=0.2,
+                                   lambda0=args.lambda0,
+                                   lambdaT=args.lambdaT,
+                                   fix_endpoints=args.fix_endpoints,
+                                   desired_rtg=args.desired_rtg,
+                                   start_in_ground_state=args.start_in_ground_state)
             episodes.append(traj)
         # keep top-k by reward
         episodes.sort(key=lambda d: d['reward'], reverse=True)
